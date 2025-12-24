@@ -1,0 +1,32 @@
+stage1:
+  name: Stage 1
+  thrust: 5.0e6
+  isp: 260
+  prop_mass: 2.5e5
+  dry_mass: 3.0e4
+  diameter: 4.0
+  cd_table:
+    - [0.0, 0.3]
+    - [0.8, 0.35]
+    - [1.0, 0.5]
+    - [1.2, 0.4]
+    - [2.0, 0.3]
+    - [5.0, 0.25]
+    - [10.0, 0.22]
+
+stage2:
+  name: Stage 2
+  thrust: 1.0e6
+  isp: 320
+  prop_mass: 6.0e4
+  dry_mass: 8.0e3
+  diameter: 3.0
+  cd_table:
+    - [0.0, 0.25]
+    - [0.8, 0.3]
+    - [1.0, 0.45]
+    - [1.2, 0.35]
+    - [3.0, 0.25]
+    - [8.0, 0.22]
+
+payload_mass: 3.0e3
