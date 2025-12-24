@@ -49,6 +49,9 @@ class Mission:
     pitch_program: PitchProgram
     t_max: float
     dt: float
+    rtol: float
+    atol: float
+    stop_on_target: bool
     target_orbit: dict | None = None
 
 
@@ -116,6 +119,8 @@ def _integrate_segment(
     dt: float,
     drag_enabled: bool,
     events: Iterable[Callable],
+    rtol: float,
+    atol: float,
 ) -> SegmentResult:
     t_eval = np.arange(t0, t_end + dt, dt)
     sol = solve_ivp(
@@ -123,8 +128,8 @@ def _integrate_segment(
         (t0, t_end),
         state0,
         t_eval=t_eval,
-        rtol=1e-7,
-        atol=1e-9,
+        rtol=rtol,
+        atol=atol,
         args=(stage, thrust_dir_fn, drag_enabled),
         events=list(events) if events else None,
     )
@@ -192,6 +197,40 @@ def _assemble_dataframe(segments: list[SegmentResult]) -> pd.DataFrame:
     return df
 
 
+def _target_orbit_thresholds(target_orbit: dict) -> tuple[float, float, float, float, float]:
+    target_alt_m = float(target_orbit["altitude_km"]) * 1000.0
+    target_a = RE_EARTH + target_alt_m
+    target_incl = np.deg2rad(float(target_orbit["incl_deg"]))
+    tolerance = target_orbit["tolerance"]
+    tol_alt = float(tolerance["alt_km"]) * 1000.0
+    tol_incl = np.deg2rad(float(tolerance["incl_deg"]))
+    tol_ecc = float(tolerance["ecc"])
+    return target_a, target_incl, tol_alt, tol_incl, tol_ecc
+
+
+def _target_orbit_margin(r: np.ndarray, v: np.ndarray, target_orbit: dict) -> tuple[float, OrbitalElements]:
+    elements = orbital_elements(r, v)
+    target_a, target_incl, tol_alt, tol_incl, tol_ecc = _target_orbit_thresholds(target_orbit)
+    margin = max(
+        abs(elements.semi_major_axis - target_a) - tol_alt,
+        elements.eccentricity - tol_ecc,
+        abs(elements.inclination - target_incl) - tol_incl,
+    )
+    return margin, elements
+
+
+def _target_orbit_event(target_orbit: dict) -> Callable:
+    def event(_t: float, state: np.ndarray) -> float:
+        r = state[0:3]
+        v = state[3:6]
+        margin, _elements = _target_orbit_margin(r, v, target_orbit)
+        return margin
+
+    event.terminal = True
+    event.direction = -1
+    return event
+
+
 def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     stage1_cfg = vehicle_cfg["stage1"]
     stage2_cfg = vehicle_cfg["stage2"]
@@ -206,18 +245,40 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     lat0 = np.deg2rad(mission_cfg["launch_site"]["lat_deg"])
     lon0 = np.deg2rad(mission_cfg["launch_site"]["lon_deg"])
 
+    guidance_cfg = mission_cfg["guidance"]
+    t_vertical = guidance_cfg.get("t_vertical_s", guidance_cfg.get("t_vertical"))
+    if t_vertical is None:
+        raise KeyError("guidance.t_vertical_s or guidance.t_vertical is required")
+
+    if "pitch_schedule_deg" in guidance_cfg:
+        points = np.array(guidance_cfg["pitch_schedule_deg"], dtype=float)
+        points[:, 1] = 90.0 - points[:, 1]
+    else:
+        points = np.array(guidance_cfg["pitch_points"], dtype=float)
+
     pitch_program = PitchProgram(
-        t_vertical=float(mission_cfg["guidance"]["t_vertical"]),
-        points=np.array(mission_cfg["guidance"]["pitch_points"], dtype=float),
+        t_vertical=float(t_vertical),
+        points=points,
     )
+
+    sim_cfg = mission_cfg.get("sim", mission_cfg.get("simulation"))
+    if sim_cfg is None:
+        raise KeyError("sim or simulation configuration is required")
+
+    t_max = sim_cfg.get("t_max_s", sim_cfg.get("t_max"))
+    if t_max is None:
+        raise KeyError("sim.t_max_s or sim.t_max is required")
 
     mission = Mission(
         lat0=lat0,
         lon0=lon0,
-        azimuth_deg=float(mission_cfg["guidance"]["azimuth_deg"]),
+        azimuth_deg=float(guidance_cfg["azimuth_deg"]),
         pitch_program=pitch_program,
-        t_max=float(mission_cfg["simulation"]["t_max"]),
-        dt=float(mission_cfg["simulation"]["dt"]),
+        t_max=float(t_max),
+        dt=float(sim_cfg.get("dt", 1.0)),
+        rtol=float(sim_cfg.get("rtol", 1e-7)),
+        atol=float(sim_cfg.get("atol", 1e-9)),
+        stop_on_target=bool(sim_cfg.get("stop_on_target", False)),
         target_orbit=mission_cfg.get("target_orbit"),
     )
 
@@ -239,6 +300,8 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     t0 = 0.0
 
     stage1_events = [_burnout_event(t0, stage1.burn_time), _reentry_event]
+    if mission.stop_on_target and mission.target_orbit:
+        stage1_events.append(_target_orbit_event(mission.target_orbit))
     segments.append(
         _integrate_segment(
             state,
@@ -250,6 +313,8 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
             mission.dt,
             drag_enabled=True,
             events=stage1_events,
+            rtol=mission.rtol,
+            atol=mission.atol,
         )
     )
 
@@ -259,9 +324,19 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     if h_end <= 0 or t0 >= mission.t_max:
         return _assemble_dataframe(segments)
 
+    if mission.stop_on_target and mission.target_orbit:
+        margin, elements = _target_orbit_margin(state[0:3], state[3:6], mission.target_orbit)
+        if margin <= 0:
+            df = _assemble_dataframe(segments)
+            df.attrs["orbit_elements"] = elements
+            df.attrs["target_orbit_achieved"] = True
+            return df
+
     state[6] -= stage1.dry_mass
 
     stage2_events = [_burnout_event(t0, stage2.burn_time), _reentry_event]
+    if mission.stop_on_target and mission.target_orbit:
+        stage2_events.append(_target_orbit_event(mission.target_orbit))
     segments.append(
         _integrate_segment(
             state,
@@ -273,6 +348,8 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
             mission.dt,
             drag_enabled=True,
             events=stage2_events,
+            rtol=mission.rtol,
+            atol=mission.atol,
         )
     )
 
@@ -281,6 +358,14 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     h_end = np.linalg.norm(state[0:3]) - RE_EARTH
     if h_end <= 0 or t0 >= mission.t_max:
         return _assemble_dataframe(segments)
+
+    if mission.stop_on_target and mission.target_orbit:
+        margin, elements = _target_orbit_margin(state[0:3], state[3:6], mission.target_orbit)
+        if margin <= 0:
+            df = _assemble_dataframe(segments)
+            df.attrs["orbit_elements"] = elements
+            df.attrs["target_orbit_achieved"] = True
+            return df
 
     coast_stage = Stage(
         name="coast",
@@ -292,6 +377,9 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
         cd_table=stage2.cd_table,
     )
 
+    coast_events = [_reentry_event]
+    if mission.stop_on_target and mission.target_orbit:
+        coast_events.append(_target_orbit_event(mission.target_orbit))
     segments.append(
         _integrate_segment(
             state,
@@ -302,7 +390,9 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
             thrust_dir_fn,
             mission.dt,
             drag_enabled=True,
-            events=[_reentry_event],
+            events=coast_events,
+            rtol=mission.rtol,
+            atol=mission.atol,
         )
     )
 
@@ -311,7 +401,11 @@ def run_simulation(vehicle_cfg: dict, mission_cfg: dict) -> pd.DataFrame:
     if mission.target_orbit:
         r = df[["x", "y", "z"]].to_numpy()
         v = df[["vx", "vy", "vz"]].to_numpy()
-        elements = orbital_elements(r[-1], v[-1])
+        if mission.stop_on_target:
+            margin, elements = _target_orbit_margin(r[-1], v[-1], mission.target_orbit)
+            df.attrs["target_orbit_achieved"] = margin <= 0
+        else:
+            elements = orbital_elements(r[-1], v[-1])
         df.attrs["orbit_elements"] = elements
 
     return df
