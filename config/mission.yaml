@@ -1,0 +1,23 @@
+launch_site:
+  lat_deg: 28.5
+  lon_deg: -80.6
+
+guidance:
+  azimuth_deg: 90.0
+  t_vertical: 10.0
+  pitch_points:
+    - [10.0, 0.0]
+    - [60.0, 20.0]
+    - [120.0, 45.0]
+    - [180.0, 70.0]
+    - [240.0, 80.0]
+
+simulation:
+  t_max: 800.0
+  dt: 1.0
+
+# Optional target orbit for evaluation (not enforced by events yet).
+# target_orbit:
+#   rp_km: 200.0
+#   ra_km: 200.0
+#   tolerance_km: 10.0
